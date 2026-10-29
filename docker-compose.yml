@@ -1,0 +1,102 @@
+# Next-Generation WAF – Docker Compose Stack
+#
+# Architecture:
+#   Internet/Host → :8080 → WAF → secure-net → DVWA, Redis, Elasticsearch
+#
+# Only the WAF publishes a host port.  All backend services are isolated
+# on the internal 'secure-net' bridge network.
+
+services:
+  # ------------------------------------------------------------------
+  # WAF – Layer 7 reverse proxy with inspection pipeline
+  # ------------------------------------------------------------------
+  waf:
+    build: ./waf
+    container_name: ngwaf
+    ports:
+      - "8080:8000"
+    environment:
+      BACKEND_URL: "http://dvwa:80"
+      REDIS_URL: "redis://redis:6379/0"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      ALLOWED_ORIGINS: "http://localhost:8080"
+      RATE_LIMIT_RPS: "50"
+      RATE_LIMIT_WINDOW_SEC: "60"
+      STRIKE_THRESHOLD: "5"
+      BAN_TTL_SEC: "600"
+    networks:
+      - secure-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      dvwa:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: >
+        python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/__waf/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ------------------------------------------------------------------
+  # DVWA – Intentionally vulnerable backend (protected by WAF)
+  # ------------------------------------------------------------------
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: dvwa
+    environment:
+      DEFAULT_SECURITY_LEVEL: low
+    networks:
+      - secure-net
+    # No published ports – only reachable through the WAF
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Redis – Hot-path state for rate limiting, strikes, bans
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: waf-redis
+    networks:
+      - secure-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Elasticsearch – Audit log storage and search
+  # ------------------------------------------------------------------
+  elasticsearch:
+    image: elasticsearch:8.12.0
+    container_name: waf-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"
+    networks:
+      - secure-net
+    # No published ports – only reachable from secure-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+# ------------------------------------------------------------------
+# Networks
+# ------------------------------------------------------------------
+networks:
+  secure-net:
+    driver: bridge
+    # 'internal: true' prevents containers from reaching the internet.
+    # The WAF's published port (8080) still works because Docker handles
+    # the host-side mapping separately from the container network.

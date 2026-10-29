@@ -1,0 +1,326 @@
+# Next-Generation Web Application Firewall (WAF): Architecture
+
+## 1. Project Overview
+
+This project is a containerized Layer 7 reverse-proxy WAF that protects a backend web application (Damn Vulnerable Web App, DVWA) from common web attacks.
+
+Legacy WAFs rely mainly on regular expressions, which are easy to bypass with encoding tricks and syntax variations. This WAF instead uses a layered inspection pipeline:
+
+1. **Normalization** reduces each input to a canonical form, so obfuscated payloads look like their plain equivalents.
+2. **Semantic analysis** tokenizes the canonical input with libinjection and checks whether it parses as SQL or HTML/JavaScript structure, rather than matching fixed strings.
+3. **Signature fallback** uses a small set of regex rules for indicators that are fixed by nature (known scanner User-Agents, shell metacharacters, webshell tags).
+4. **Reputation and rate limiting** (Redis) throttle and ban abusive clients.
+
+The WAF is a defense-in-depth layer. It reduces exposure to known attack classes and evasion techniques, but it does not replace secure coding in the backend (see Section 3, Non-Goals).
+
+### Goals
+
+- Detect and block SQLi and XSS payloads, including common evasions (double encoding, Unicode escapes, whitespace/comment obfuscation, HTTP Parameter Pollution).
+- Detect OS command injection and path traversal indicators.
+- Throttle and ban automated scanners.
+- Produce structured, searchable audit logs of every blocked request.
+- Provide a repeatable adversarial test harness that measures detection rate, false positives, and added latency.
+
+## 2. Technology Stack
+
+| Concern | Technology |
+|---|---|
+| Proxy language | Python 3.11+ |
+| Web framework / server | FastAPI + Uvicorn (ASGI) |
+| Semantic detection | libinjection Python bindings (pin and verify the exact PyPI package in `requirements.txt`) |
+| Outbound proxy client | httpx (`AsyncClient`, shared connection pool) |
+| Infrastructure | Docker + Docker Compose |
+| State / rate limiting | Redis |
+| Audit logging | Elasticsearch (JSON, ECS-aligned fields) |
+| Adversarial testing | httpx + pytest |
+
+## 3. Threat Model
+
+### In scope
+
+| Threat | Primary detection layer |
+|---|---|
+| SQL injection (in-band, blind, with evasions) | normalizer + libinjection |
+| Reflected / stored XSS payloads in requests | normalizer + libinjection |
+| HTTP Parameter Pollution | normalizer (per-value and joined inspection) |
+| Path traversal | normalizer (detect after decode) |
+| OS command injection indicators | signatures |
+| PHP webshell upload tags / known malicious User-Agents | signatures |
+| Automated scanning and brute force | rate limiter / reputation engine |
+| Cross-origin state-changing requests | Origin/Referer allowlist + cookie hardening |
+
+### Non-Goals
+
+- **Not a substitute for secure code.** libinjection is a fingerprint-based tokenizer with known false positives and published bypasses. Detection is probabilistic.
+- **No coverage** for SSRF, insecure deserialization, business-logic flaws, authentication/authorization flaws, or request smuggling.
+- **No response-body inspection** (data-leak prevention). The WAF only adds response headers.
+- **No TLS termination.** In the lab, traffic between client and WAF is plain HTTP. In a real deployment, TLS would terminate at a load balancer or at the WAF, which is out of scope here.
+- **No DDoS protection** beyond per-IP rate limiting.
+
+### Trust boundaries
+
+- The internet is untrusted. All headers, query strings, paths, cookies, and bodies are attacker-controlled.
+- The WAF is the only trusted entry point.
+- The backend (DVWA) is intentionally vulnerable. It is protected by network isolation and the WAF, never by its own code.
+
+## 4. System Architecture and Network Topology
+
+The design uses network segmentation with a single internet-facing choke point (DMZ-style).
+
+```
+                       Internet / Host
+                             |
+                     host port 8080 (published)
+                             |
+        +--------------------v---------------------+
+        |                  WAF                     |
+        |  FastAPI/Uvicorn: inspection pipeline    |
+        +----+-----------+-----------+-------------+
+             |           |           |
+       secure-net (internal Docker bridge, no published ports)
+             |           |           |
+        +----v---+  +----v------+  +-v-----------+
+        |  DVWA  |  |   Redis   |  |Elasticsearch|
+        | :80    |  |  :6379    |  |   :9200     |
+        +--------+  +-----------+  +-------------+
+```
+
+- **Public zone:** only the WAF container publishes a host port (`8080`).
+- **`secure-net`:** an internal Docker bridge network (`internal: true` where the stack allows it) connecting the WAF, DVWA, Redis, and Elasticsearch.
+- **Isolated backend:** DVWA exposes port 80 only to `secure-net`. Redis and Elasticsearch publish no host ports.
+- **Outbound access:** the WAF needs no outbound internet access.
+- **Note on terminology:** this is network segmentation with least exposure. It is not a full zero-trust architecture, because there is no per-request identity or mutual authentication between components.
+
+## 5. Request Lifecycle
+
+Every inbound request passes through the stages below in order. Cheap checks run first.
+
+```
+Client -> [1] Client IP resolution
+       -> [2] Ban + rate-limit check (Redis)        -> 429
+       -> [3] Request sanity limits                 -> 413 / 400
+       -> [4] Origin/Referer (CSRF/CORS) check      -> 403
+       -> [5] Normalization                         -> 400 (suspicious encoding)
+       -> [6] Signature checks                      -> 403
+       -> [7] Semantic analysis (libinjection)      -> 403
+       -> [8] Proxy to backend (clean traffic)
+       -> [9] Response hardening (headers, cookies) -> Client
+```
+
+On any block, the WAF records a strike in Redis, enqueues an audit log event, and returns the block response. The WAF never forwards a blocked request.
+
+| Stage | What happens |
+|---|---|
+| 1. Client IP | Use the socket peer address. Honor `X-Forwarded-For` only when the peer is in `TRUSTED_PROXIES`, and then take the right-most untrusted hop. By default no proxy headers are trusted. |
+| 2. Ban / rate limit | Reject if `ban:{ip}` exists. Otherwise run the sliding-window counter (Section 7.1). |
+| 3. Sanity limits | Enforce maximum body size, header count/size, URL length, and allowed methods. Unsupported `Content-Type` values are not parsed but are still size-limited. |
+| 4. CSRF/CORS | For state-changing methods (`POST`, `PUT`, `PATCH`, `DELETE`), require `Origin` (or `Referer` as fallback) to match `ALLOWED_ORIGINS`. Handle CORS preflight per the same allowlist. |
+| 5. Normalization | Canonicalize all inspectable inputs (Section 6.1). |
+| 6. Signatures | Run fixed-indicator regex rules over normalized values and select raw headers. |
+| 7. Semantic analysis | Run libinjection over each normalized value (Section 6.2). |
+| 8. Proxy | Forward the original, unmodified request to the backend (see note below). |
+| 9. Response hardening | Add security headers and harden cookies before returning. |
+
+**Inspect normalized, forward original.** Normalized data is used only for detection. The backend receives the original bytes, so the WAF never alters application behavior or introduces its own parsing differences.
+
+## 6. Module Directory and Responsibilities
+
+```
+waf/
+├── main.py              # ASGI entry point; orchestrates pipeline, returns block responses
+├── proxy.py             # Reverse proxy to backend; response hardening
+├── rate_limiter.py      # Redis-backed rate limiting, strikes, bans
+├── logger.py            # Async ECS-style audit logging to Elasticsearch
+├── config.py            # Environment-driven settings (validated at startup)
+├── detection/
+│   ├── __init__.py
+│   ├── normalizer.py    # Canonicalization of all inspectable inputs
+│   ├── semantic.py      # libinjection-based SQLi/XSS detection
+│   └── signatures.py    # Regex rules for fixed indicators of compromise
+├── Dockerfile
+└── requirements.txt
+```
+
+### 6.1 `detection/normalizer.py`
+
+Produces a list of **inspection units**, each tagged with its source (`path`, `query:<name>`, `form:<name>`, `json:<path>`, `header:<name>`, `cookie:<name>`).
+
+**Decoding (fixpoint, not single-pass).**
+- Repeatedly apply URL-decode, HTML-entity decode, and `\uXXXX` / `\xNN` unescape until the value stops changing, up to `MAX_DECODE_PASSES` (default 5).
+- If the value is still changing after the limit, treat it as an evasion attempt and block it (stage 5 returns 400, logged as `normalization.excessive_encoding`).
+- Apply Unicode NFKC normalization to collapse full-width and compatibility characters.
+- Remove null bytes and other control characters (except tab, CR, LF).
+
+**Whitespace and comments.**
+- Collapse runs of whitespace (including Unicode spaces) to a single space.
+- Do not aggressively strip SQL comments. libinjection tokenizes comments itself, and over-stripping can hide the structure it needs to see.
+
+**HTTP Parameter Pollution.**
+- Different backends resolve duplicate parameters differently (first, last, comma-joined, array). The WAF cannot know which one applies.
+- Therefore, inspect **every individual value** of a repeated parameter, **and** the concatenation of all values (comma-joined and space-joined). A split payload (`id=1' UNION&id=SELECT ...`) is caught by the joined form.
+
+**Path traversal.**
+- Detect rather than strip. After full decoding, if the path or any value contains `../`, `..\`, or a `..` segment (including mixed separators), block.
+- Stripping is intentionally avoided because it is bypassable (`....//` collapses to `../`).
+
+**Body handling.**
+- `application/x-www-form-urlencoded`: parse into name/value pairs.
+- `application/json`: walk the structure and inspect every string key and value (depth limit enforced).
+- `multipart/form-data`: inspect field values, filenames, and part headers. File contents are not deeply inspected, but webshell tag signatures run over text-like uploads up to a size cap.
+- Other content types: inspect as a raw decoded string, subject to the size limit.
+
+### 6.2 `detection/semantic.py`
+
+- Runs libinjection's SQLi and XSS detectors on each normalized inspection unit.
+- Returns a verdict object: `{category, fingerprint, source, unit_id}`. The libinjection fingerprint is logged so analysts can see why a request was blocked.
+- Strategy for false positives: apply detection per unit, never to the whole body at once, and support a configurable **per-parameter allowlist** (for example, a rich-text field known to carry HTML).
+- Known limitation: libinjection can miss novel payloads and can flag benign text that resembles SQL (for example, a comment like `select a team'`). The test harness (Section 10) measures both.
+
+### 6.3 `detection/signatures.py`
+
+A short, curated regex set, deliberately kept small:
+
+- Known malicious or scanner User-Agents (sqlmap, nikto, and similar).
+- OS command injection metacharacter patterns (`;`, `|`, `&&`, backticks, `$()` in suspicious contexts).
+- PHP webshell tags and common webshell function patterns.
+
+Each rule has an ID, a category, and a severity, so blocks are attributable in logs. Rules are compiled once at startup.
+
+### 6.4 `main.py`
+
+- Creates the ASGI app and a catch-all route that accepts any method and path.
+- Orchestrates stages 1 to 7 and delegates stage 8 to `proxy.py`.
+- Returns uniform block responses (`403`, `429`, `413`, `400`) with a generic body and a request ID that matches the audit log. It never reveals which rule fired.
+
+### 6.5 `proxy.py`
+
+- Uses a single shared `httpx.AsyncClient` with connection pooling and explicit timeouts.
+- Streams request and response bodies where possible to avoid buffering large payloads.
+- Strips hop-by-hop headers and sets `X-Forwarded-For` / `X-Forwarded-Proto` for the backend.
+- **Response hardening:**
+  - Adds `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy` (without overwriting stricter values the backend already sets).
+  - Rewrites `Set-Cookie` to add `HttpOnly` and `SameSite=Lax` when absent (and `Secure` when behind HTTPS). This provides the SameSite protection layer of the CSRF defense.
+  - Removes `Server` / `X-Powered-By` disclosure headers.
+- Backend errors or timeouts return a generic `502` / `504`.
+
+### 6.6 `config.py`
+
+Centralizes settings loaded from environment variables and validated at startup (fail fast on bad config):
+
+| Setting | Purpose |
+|---|---|
+| `BACKEND_URL` | Internal URL of DVWA |
+| `REDIS_URL`, `ELASTICSEARCH_URL` | Data store connections |
+| `RATE_LIMIT_RPS`, `RATE_LIMIT_WINDOW_SEC` | Sliding-window limits |
+| `STRIKE_THRESHOLD`, `BAN_TTL_SEC` | Strike-to-ban policy |
+| `TRUSTED_PROXIES` | CIDR list for `X-Forwarded-For` handling (empty by default) |
+| `ALLOWED_ORIGINS` | CSRF/CORS Origin allowlist |
+| `MAX_BODY_BYTES`, `MAX_HEADER_BYTES`, `MAX_URL_LEN` | Sanity limits |
+| `MAX_DECODE_PASSES` | Normalizer fixpoint limit |
+| `PARAM_ALLOWLIST` | Per-parameter detection exemptions |
+| `LOG_QUEUE_SIZE`, `LOG_BATCH_SIZE` | Async logging buffer |
+
+## 7. Auditing and State
+
+### 7.1 `rate_limiter.py` (Reputation Engine)
+
+**Sliding-window rate limiting** uses a Redis sorted set per client IP.
+
+- Key: `rate:{ip}` (sorted set; score and member are the request timestamp plus a unique suffix).
+- On each request, a single Lua script atomically: removes entries older than the window, adds the current request, counts entries, and sets a TTL equal to the window. Atomicity avoids race conditions between concurrent requests.
+- If the count exceeds `RATE_LIMIT_RPS * RATE_LIMIT_WINDOW_SEC`, return `429`, add a strike, and set a `Retry-After` header.
+
+**Strikes and bans.**
+- `strikes:{ip}`: integer incremented on each rate-limit violation or detection block, with a TTL so old behavior decays.
+- `ban:{ip}`: set with TTL `BAN_TTL_SEC` when strikes reach `STRIKE_THRESHOLD`. While it exists, every request is rejected with `429` at stage 2 before any inspection work.
+
+**Client identity.** Bans are keyed on the IP resolved in stage 1 (socket peer by default, `X-Forwarded-For` only from trusted proxies). Shared NAT can cause collateral blocking; this is accepted and documented.
+
+### 7.2 `logger.py` (SIEM Integration)
+
+- Every **blocked** request produces one JSON event. Allowed requests are not logged by default (configurable sampling) to control volume.
+- Fields follow ECS naming where applicable:
+
+| Field | Example |
+|---|---|
+| `@timestamp` | ISO 8601 UTC |
+| `event.category`, `event.action` | `intrusion_detection`, `blocked` |
+| `source.ip` | resolved client IP |
+| `http.request.method`, `url.original` | `POST`, `/login.php` |
+| `user_agent.original` | raw User-Agent |
+| `rule.id`, `rule.category` | `SQLI-LIBINJECTION`, `sqli` |
+| `waf.module`, `waf.fingerprint`, `waf.source` | `semantic`, `s&1c`, `form:id` |
+| `waf.request_id` | matches the block response |
+
+- **Sensitive data handling:** payload excerpts are truncated (for example, 512 bytes), and values from fields named like `password`, `token`, or `secret`, plus `Cookie` / `Authorization` headers, are redacted.
+- **Non-blocking writes:** events go to a bounded in-memory queue and are bulk-indexed by a background task. Request handling never awaits Elasticsearch.
+- **Index management:** daily indices (`waf-logs-YYYY.MM.dd`) with an explicit mapping and a retention policy.
+
+## 8. Data Store Decisions
+
+The data layer is split because rate limiting and audit logging have opposite requirements.
+
+| | Redis | Elasticsearch |
+|---|---|---|
+| Role | Hot-path state | Audit log search |
+| Access pattern | Many tiny atomic reads/writes per request | Batched writes, ad hoc queries |
+| Latency need | Sub-millisecond, blocks the request path | Seconds acceptable, off the request path |
+| Why chosen | In-memory, atomic ops/Lua, native TTL for windows, strikes, bans | Inverted index for full-text search over payloads, aggregations by rule/module/IP |
+| Data | `rate:{ip}`, `strikes:{ip}`, `ban:{ip}` | Blocked-request events |
+
+## 9. Failure Modes
+
+The WAF's policy is: **detection fails closed; auxiliary services fail open, visibly.**
+
+| Failure | Behavior |
+|---|---|
+| Redis unavailable | Rate limiting and bans are skipped (fail-open for that stage only). Inspection stages 3 to 7 continue to run in-process. A metric and a high-severity log line are emitted. Redis calls use short timeouts so they cannot stall requests. |
+| Elasticsearch unavailable | Logging fails open. Events stay in the bounded queue; on overflow, the oldest events are dropped and a counter increments. Events are also written to stdout as JSON as a fallback. |
+| Backend unavailable or slow | Return `502` / `504`. The WAF itself stays healthy. |
+| Detection error (normalizer or libinjection raises) | Fail closed: block with `403` and log `detection.error`. |
+| Oversized or malformed request | Reject at stage 3 before any parsing. |
+| WAF process crash | Docker restarts the container. There is no traffic path to DVWA that bypasses the WAF, so an outage means loss of availability, not protection. |
+
+A `/__waf/health` endpoint (not proxied, internal only) reports Redis, Elasticsearch queue, and backend status for container health checks.
+
+## 10. Testing and Evaluation
+
+Testing is part of the design, not an afterthought. Claims about detection are backed by measurements.
+
+**Test layers**
+
+1. **Unit tests:** normalizer (encoding fixpoints, HPP, traversal, Unicode), signatures, semantic verdicts, config validation.
+2. **Integration tests:** full pipeline against DVWA in Docker Compose; rate limiter behavior with real Redis.
+3. **Adversarial suite (httpx):**
+   - A corpus of SQLi and XSS payloads in categories: baseline, encoding evasions (single, double, mixed), case/whitespace/comment obfuscation, HPP splits, JSON-body and multipart delivery, and header/cookie injection.
+   - The same corpus is run twice: **direct to DVWA** (confirms the payloads actually work) and **through the WAF** (confirms they are blocked).
+4. **Benign corpus:** realistic legitimate traffic (forms, search queries, names like `O'Brien`, text containing SQL-like words, HTML-ish content) to measure false positives.
+5. **Rate-limit tests:** burst, slow-and-steady, and distributed-key scenarios; verify the strike-to-ban transition and TTL expiry.
+
+**Metrics reported**
+
+| Metric | Definition |
+|---|---|
+| Detection rate | Blocked malicious requests / total malicious requests, per category |
+| Bypass list | Payloads that got through, kept as regression cases |
+| False-positive rate | Blocked benign requests / total benign requests |
+| Added latency | p50 / p95 / p99 of WAF vs. direct-to-backend |
+| Throughput | Requests per second at fixed concurrency |
+
+Every bypass found becomes a permanent regression test, and the results table is kept in the repository.
+
+## 11. Known Limitations
+
+- libinjection is heuristic: expect some bypasses and some false positives; the benign and adversarial corpora quantify them.
+- Rate limiting by IP is imperfect behind shared NAT or with distributed attackers.
+- Origin/Referer checks protect browser-initiated cross-site requests, but non-browser clients can set any header; the WAF does not validate application-level CSRF tokens.
+- Without TLS termination, the lab setup does not protect traffic in transit.
+- Inspecting large bodies adds latency; limits and streaming mitigate but do not eliminate this.
+
+## 12. Possible Future Work
+
+- Response-side inspection and data-leak detection.
+- Anomaly scoring (combine weak signals instead of binary block).
+- Hot-reloadable rule configuration.
+- Prometheus metrics and a Kibana dashboard for blocked-traffic analytics.
+- TLS termination and mutual TLS between internal components.
